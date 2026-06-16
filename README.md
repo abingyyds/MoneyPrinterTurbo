@@ -27,6 +27,45 @@
 
 </div>
 
+## Hosted Platform / Railway
+
+本分支额外提供 Railway 在线平台模式：
+
+- 支持 SubRouter 主站/分站账号密码登录。
+- 登录后后端自动创建或复用用户级 SubRouter 调用密钥。
+- 用户可直接选择当前账号可用模型生成短视频文案和关键词。
+- 多用户数据隔离：每个用户的任务、上传素材和输出文件独立存放。
+- Railway 只需要挂载一个 `/data` Volume，平台 SQLite 和所有用户数据都在 `/data` 下。
+
+Railway 部署使用仓库根目录的 `Dockerfile` 和 `railway.toml`。关键环境变量：
+
+```bash
+MPT_PLATFORM_ENABLED=true
+MPT_DATA_DIR=/data
+SUBROUTER_BASE_URL=http://subrouter.railway.internal:8080
+```
+
+`SUBROUTER_BASE_URL` 是 SubRouter 管理/API 服务根地址，不要手动加 `/v1`。如果 Railway 里的 SubRouter 服务名不是 `subrouter`，把地址里的服务名替换成实际服务名。这个内网地址只由后端访问，不会展示给用户。
+
+素材源 API Key 可选配置：
+
+```bash
+PEXELS_API_KEYS=key1,key2
+PIXABAY_API_KEYS=key1,key2
+COVERR_API_KEYS=key1,key2
+```
+
+TTS 服务密钥也可以由 Railway 管理员统一配置，不会展示给前端用户：
+
+```bash
+AZURE_SPEECH_REGION=eastus
+AZURE_SPEECH_KEY=your-key
+SILICONFLOW_API_KEY=your-key
+MIMO_API_KEY=your-key
+MIMO_BASE_URL=https://api.xiaomimimo.com/v1
+MIMO_TTS_MODEL_NAME=mimo-v2.5-tts
+```
+
 ## 特别感谢 🙏
 
 <table align="center">

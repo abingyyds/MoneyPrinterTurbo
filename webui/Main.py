@@ -23,6 +23,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import platform
 from app.services import llm, voice
 from app.services import task as tm
 from app.utils import utils
@@ -222,6 +223,114 @@ def tr(key):
     loc = locales.get(st.session_state["ui_language"], {})
     return loc.get("Translation", {}).get(key, key)
 
+
+def stop_if_not_signed_in():
+    if not platform.platform_enabled():
+        return
+
+    if "platform_user" not in st.session_state:
+        st.session_state["platform_user"] = None
+    if "platform_models" not in st.session_state:
+        st.session_state["platform_models"] = []
+    if "platform_model" not in st.session_state:
+        st.session_state["platform_model"] = ""
+
+    user = st.session_state.get("platform_user")
+    if not user:
+        st.title("MoneyPrinterTurbo")
+        st.caption("使用 SubRouter 账号密码登录后，选择模型即可生成视频。")
+        with st.form("subrouter_login_form"):
+            username = st.text_input("用户名")
+            password = st.text_input("密码", type="password")
+            submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
+        if submitted:
+            try:
+                user = platform.get_store().subrouter_password_login(username=username, password=password)
+                st.session_state["platform_user"] = user
+                st.session_state["platform_models"] = []
+                st.session_state["platform_model"] = user.get("subrouter", {}).get("default_model", "")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        st.stop()
+
+    platform.activate_user_context(user["id"])
+
+
+def render_platform_account_bar():
+    if not platform.platform_enabled():
+        return
+
+    user = st.session_state.get("platform_user") or {}
+    subrouter = user.get("subrouter", {})
+    distributor = subrouter.get("distributor_name") or subrouter.get("distributor_slug") or ""
+    with st.sidebar:
+        st.caption("ACCOUNT")
+        st.write(distributor or user.get("username", "当前账号"))
+        if st.button("退出登录", use_container_width=True):
+            st.session_state["platform_user"] = None
+            st.session_state["platform_models"] = []
+            st.session_state["platform_model"] = ""
+            platform.current_user_id.set("")
+            platform.current_llm_credentials.set(None)
+            st.rerun()
+
+        try:
+            payload = platform.get_store().fetch_models(user["id"])
+            models = [item["id"] for item in payload.get("models", []) if item.get("type") == "text"]
+            if not models:
+                models = [item["id"] for item in payload.get("models", []) if item.get("id")]
+            st.session_state["platform_models"] = models
+            selected_model = st.session_state.get("platform_model") or payload.get("default_model") or (models[0] if models else "")
+            if selected_model and selected_model not in models:
+                models = [selected_model, *models]
+            if models:
+                index = models.index(selected_model) if selected_model in models else 0
+                selected_model = st.selectbox("模型", options=models, index=index)
+                st.session_state["platform_model"] = selected_model
+                platform.get_store().set_default_model(user["id"], selected_model)
+                platform.activate_user_context(user["id"])
+                creds = platform.current_llm_credentials.get() or {}
+                creds["model"] = selected_model
+                platform.current_llm_credentials.set(creds)
+            else:
+                st.warning("当前账号没有可用模型")
+        except Exception as exc:
+            st.error(f"模型列表读取失败: {exc}")
+
+
+stop_if_not_signed_in()
+render_platform_account_bar()
+
+if platform.platform_enabled():
+    config.app["llm_provider"] = "openai"
+    config.app["openai_api_key"] = ""
+    config.app["openai_base_url"] = ""
+    if os.environ.get("PEXELS_API_KEYS"):
+        config.app["pexels_api_keys"] = [
+            item.strip() for item in os.environ["PEXELS_API_KEYS"].split(",") if item.strip()
+        ]
+    if os.environ.get("PIXABAY_API_KEYS"):
+        config.app["pixabay_api_keys"] = [
+            item.strip() for item in os.environ["PIXABAY_API_KEYS"].split(",") if item.strip()
+        ]
+    if os.environ.get("COVERR_API_KEYS"):
+        config.app["coverr_api_keys"] = [
+            item.strip() for item in os.environ["COVERR_API_KEYS"].split(",") if item.strip()
+        ]
+    if os.environ.get("AZURE_SPEECH_REGION"):
+        config.azure["speech_region"] = os.environ["AZURE_SPEECH_REGION"].strip()
+    if os.environ.get("AZURE_SPEECH_KEY"):
+        config.azure["speech_key"] = os.environ["AZURE_SPEECH_KEY"].strip()
+    if os.environ.get("SILICONFLOW_API_KEY"):
+        config.siliconflow["api_key"] = os.environ["SILICONFLOW_API_KEY"].strip()
+    if os.environ.get("MIMO_API_KEY"):
+        config.app["mimo_api_key"] = os.environ["MIMO_API_KEY"].strip()
+    if os.environ.get("MIMO_BASE_URL"):
+        config.app["mimo_base_url"] = os.environ["MIMO_BASE_URL"].strip()
+    if os.environ.get("MIMO_TTS_MODEL_NAME"):
+        config.app["mimo_tts_model_name"] = os.environ["MIMO_TTS_MODEL_NAME"].strip()
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_groq_model_ids(api_key: str, base_url: str) -> list[str]:
     if not api_key:
@@ -253,7 +362,7 @@ def get_groq_model_ids(api_key: str, base_url: str) -> list[str]:
         return []
 
 # 创建基础设置折叠框
-if not config.app.get("hide_config", False):
+if not platform.platform_enabled() and not config.app.get("hide_config", False):
     with st.expander(tr("Basic Settings"), expanded=False):
         config_panels = st.columns(3)
         left_config_panel = config_panels[0]
@@ -277,7 +386,12 @@ if not config.app.get("hide_config", False):
         # 中间面板 - LLM 设置
 
         with middle_config_panel:
-            st.write(tr("LLM Settings"))
+            if platform.platform_enabled():
+                st.write(tr("LLM Settings"))
+                selected_model = st.session_state.get("platform_model", "")
+                st.info(f"当前模型：{selected_model}" if selected_model else "请在左侧选择模型")
+            else:
+                st.write(tr("LLM Settings"))
             # 下拉框需要展示“AIHubMix（推荐）”这类面向用户的文案，
             # 但配置文件和后端逻辑必须继续使用稳定的小写 provider id。
             # 因此这里显式维护 display label 和 provider id 的映射，避免
@@ -285,7 +399,8 @@ if not config.app.get("hide_config", False):
             aihubmix_label = f"AIHubMix ({tr('Recommended')})"
             if config.ui.get("language") == "zh":
                 aihubmix_label = "AIHubMix（推荐）"
-            llm_provider_options = [
+            if not platform.platform_enabled():
+                llm_provider_options = [
                 ("OpenAI", "openai"),
                 (aihubmix_label, "aihubmix"),
                 ("AIML API", "aimlapi"),
@@ -306,26 +421,29 @@ if not config.app.get("hide_config", False):
                 ("MiMo", "mimo"),
                 ("Pollinations", "pollinations"),
                 ("LiteLLM", "litellm"),
-            ]
-            llm_provider_labels = [label for label, _ in llm_provider_options]
-            llm_provider_values = {
-                label: provider_id for label, provider_id in llm_provider_options
-            }
-            saved_llm_provider = config.app.get("llm_provider", "openai").lower()
-            saved_llm_provider_index = 0
-            for i, (_, provider_id) in enumerate(llm_provider_options):
-                if provider_id == saved_llm_provider:
-                    saved_llm_provider_index = i
-                    break
+                ]
+                llm_provider_labels = [label for label, _ in llm_provider_options]
+                llm_provider_values = {
+                    label: provider_id for label, provider_id in llm_provider_options
+                }
+                saved_llm_provider = config.app.get("llm_provider", "openai").lower()
+                saved_llm_provider_index = 0
+                for i, (_, provider_id) in enumerate(llm_provider_options):
+                    if provider_id == saved_llm_provider:
+                        saved_llm_provider_index = i
+                        break
 
-            llm_provider_label = st.selectbox(
-                tr("LLM Provider"),
-                options=llm_provider_labels,
-                index=saved_llm_provider_index,
-            )
-            llm_helper = st.container()
-            llm_provider = llm_provider_values[llm_provider_label]
-            config.app["llm_provider"] = llm_provider
+                llm_provider_label = st.selectbox(
+                    tr("LLM Provider"),
+                    options=llm_provider_labels,
+                    index=saved_llm_provider_index,
+                )
+                llm_helper = st.container()
+                llm_provider = llm_provider_values[llm_provider_label]
+                config.app["llm_provider"] = llm_provider
+            else:
+                llm_helper = st.container()
+                llm_provider = "openai"
 
             llm_api_key = config.app.get(f"{llm_provider}_api_key", "")
             llm_secret_key = config.app.get(
@@ -1093,19 +1211,23 @@ with middle_panel:
         ):
             saved_azure_speech_region = config.azure.get("speech_region", "")
             saved_azure_speech_key = config.azure.get("speech_key", "")
-            azure_speech_region = st.text_input(
-                tr("Speech Region"),
-                value=saved_azure_speech_region,
-                key="azure_speech_region_input",
-            )
-            azure_speech_key = st.text_input(
-                tr("Speech Key"),
-                value=saved_azure_speech_key,
-                type="password",
-                key="azure_speech_key_input",
-            )
-            config.azure["speech_region"] = azure_speech_region
-            config.azure["speech_key"] = azure_speech_key
+            if platform.platform_enabled():
+                if not saved_azure_speech_region or not saved_azure_speech_key:
+                    st.warning("管理员未配置 Azure Speech，当前语音不可用")
+            else:
+                azure_speech_region = st.text_input(
+                    tr("Speech Region"),
+                    value=saved_azure_speech_region,
+                    key="azure_speech_region_input",
+                )
+                azure_speech_key = st.text_input(
+                    tr("Speech Key"),
+                    value=saved_azure_speech_key,
+                    type="password",
+                    key="azure_speech_key_input",
+                )
+                config.azure["speech_region"] = azure_speech_region
+                config.azure["speech_key"] = azure_speech_key
 
         # 当选择硅基流动时，显示API key输入框和说明信息
         if selected_tts_server == "siliconflow" or (
@@ -1113,25 +1235,29 @@ with middle_panel:
         ):
             saved_siliconflow_api_key = config.siliconflow.get("api_key", "")
 
-            siliconflow_api_key = st.text_input(
-                tr("SiliconFlow API Key"),
-                value=saved_siliconflow_api_key,
-                type="password",
-                key="siliconflow_api_key_input",
-            )
+            if platform.platform_enabled():
+                if not saved_siliconflow_api_key:
+                    st.warning("管理员未配置 SiliconFlow TTS，当前语音不可用")
+            else:
+                siliconflow_api_key = st.text_input(
+                    tr("SiliconFlow API Key"),
+                    value=saved_siliconflow_api_key,
+                    type="password",
+                    key="siliconflow_api_key_input",
+                )
 
-            # 显示硅基流动的说明信息
-            st.info(
-                tr("SiliconFlow TTS Settings")
-                + ":\n"
-                + "- "
-                + tr("Speed: Range [0.25, 4.0], default is 1.0")
-                + "\n"
-                + "- "
-                + tr("Volume: Uses Speech Volume setting, default 1.0 maps to gain 0")
-            )
+                # 显示硅基流动的说明信息
+                st.info(
+                    tr("SiliconFlow TTS Settings")
+                    + ":\n"
+                    + "- "
+                    + tr("Speed: Range [0.25, 4.0], default is 1.0")
+                    + "\n"
+                    + "- "
+                    + tr("Volume: Uses Speech Volume setting, default 1.0 maps to gain 0")
+                )
 
-            config.siliconflow["api_key"] = siliconflow_api_key
+                config.siliconflow["api_key"] = siliconflow_api_key
 
         # 当选择 Xiaomi MiMo TTS 时，复用 MiMo LLM provider 的 API Key。
         # 这样用户如果同时使用 MiMo 生成文案和语音，只需要维护一份密钥。
@@ -1140,24 +1266,28 @@ with middle_panel:
         ):
             saved_mimo_api_key = config.app.get("mimo_api_key", "")
 
-            mimo_api_key = st.text_input(
-                tr("MiMo API Key"),
-                value=saved_mimo_api_key,
-                type="password",
-                key="mimo_tts_api_key_input",
-            )
+            if platform.platform_enabled():
+                if not saved_mimo_api_key:
+                    st.warning("管理员未配置 MiMo TTS，当前语音不可用")
+            else:
+                mimo_api_key = st.text_input(
+                    tr("MiMo API Key"),
+                    value=saved_mimo_api_key,
+                    type="password",
+                    key="mimo_tts_api_key_input",
+                )
 
-            st.info(
-                tr("MiMo TTS Settings")
-                + ":\n"
-                + "- "
-                + tr("Uses Xiaomi MiMo V2.5 TTS preset voices")
-                + "\n"
-                + "- "
-                + tr("Speed and volume are currently handled by the provider defaults")
-            )
+                st.info(
+                    tr("MiMo TTS Settings")
+                    + ":\n"
+                    + "- "
+                    + tr("Uses Xiaomi MiMo V2.5 TTS preset voices")
+                    + "\n"
+                    + "- "
+                    + tr("Speed and volume are currently handled by the provider defaults")
+                )
 
-            config.app["mimo_api_key"] = mimo_api_key
+                config.app["mimo_api_key"] = mimo_api_key
 
         params.voice_volume = st.selectbox(
             tr("Speech Volume"),
@@ -1334,113 +1464,115 @@ with right_panel:
             config.ui["rounded_subtitle_background"] = (
                 params.rounded_subtitle_background
             )
-    with st.expander(tr("Click to show API Key management"), expanded=False):
-        st.subheader(tr("Manage Pexels, Pixabay and Coverr API Keys"))
+    if not platform.platform_enabled():
+        with st.expander(tr("Click to show API Key management"), expanded=False):
+            st.subheader(tr("Manage Pexels, Pixabay and Coverr API Keys"))
 
-        col1, col2, col3 = st.tabs([
-            tr("Pexels API Keys"),
-            tr("Pixabay API Keys"),
-            tr("Coverr API Keys"),
-        ])
+            col1, col2, col3 = st.tabs([
+                tr("Pexels API Keys"),
+                tr("Pixabay API Keys"),
+                tr("Coverr API Keys"),
+            ])
 
-        with col1:
-            st.subheader(tr("Pexels API Keys"))
-            if config.app["pexels_api_keys"]:
-                st.write(tr("Current Keys:"))
-                for key in config.app["pexels_api_keys"]:
-                    st.code(key)
-            else:
-                st.info(tr("No Pexels API Keys currently"))
-
-            new_key = st.text_input(tr("Add Pexels API Key"), key="pexels_new_key")
-            if st.button(tr("Add Pexels API Key")):
-                if new_key and new_key not in config.app["pexels_api_keys"]:
-                    config.app["pexels_api_keys"].append(new_key)
-                    config.save_config()
-                    st.success(tr("Pexels API Key added successfully"))
-                elif new_key in config.app["pexels_api_keys"]:
-                    st.warning(tr("This API Key already exists"))
+            with col1:
+                st.subheader(tr("Pexels API Keys"))
+                if config.app["pexels_api_keys"]:
+                    st.write(tr("Current Keys:"))
+                    for key in config.app["pexels_api_keys"]:
+                        st.code(key)
                 else:
-                    st.error(tr("Please enter a valid API Key"))
+                    st.info(tr("No Pexels API Keys currently"))
 
-            if config.app["pexels_api_keys"]:
-                delete_key = st.selectbox(
-                    tr("Select Pexels API Key to delete"), config.app["pexels_api_keys"], key="pexels_delete_key"
-                )
-                if st.button(tr("Delete Selected Pexels API Key")):
-                    config.app["pexels_api_keys"].remove(delete_key)
-                    config.save_config()
-                    st.success(tr("Pexels API Key deleted successfully"))
+                new_key = st.text_input(tr("Add Pexels API Key"), key="pexels_new_key")
+                if st.button(tr("Add Pexels API Key")):
+                    if new_key and new_key not in config.app["pexels_api_keys"]:
+                        config.app["pexels_api_keys"].append(new_key)
+                        config.save_config()
+                        st.success(tr("Pexels API Key added successfully"))
+                    elif new_key in config.app["pexels_api_keys"]:
+                        st.warning(tr("This API Key already exists"))
+                    else:
+                        st.error(tr("Please enter a valid API Key"))
 
-        with col2:
-            st.subheader(tr("Pixabay API Keys"))
+                if config.app["pexels_api_keys"]:
+                    delete_key = st.selectbox(
+                        tr("Select Pexels API Key to delete"), config.app["pexels_api_keys"], key="pexels_delete_key"
+                    )
+                    if st.button(tr("Delete Selected Pexels API Key")):
+                        config.app["pexels_api_keys"].remove(delete_key)
+                        config.save_config()
+                        st.success(tr("Pexels API Key deleted successfully"))
 
-            if config.app["pixabay_api_keys"]:
-                st.write(tr("Current Keys:"))
-                for key in config.app["pixabay_api_keys"]:
-                    st.code(key)
-            else:
-                st.info(tr("No Pixabay API Keys currently"))
+            with col2:
+                st.subheader(tr("Pixabay API Keys"))
 
-            new_key = st.text_input(tr("Add Pixabay API Key"), key="pixabay_new_key")
-            if st.button(tr("Add Pixabay API Key")):
-                if new_key and new_key not in config.app["pixabay_api_keys"]:
-                    config.app["pixabay_api_keys"].append(new_key)
-                    config.save_config()
-                    st.success(tr("Pixabay API Key added successfully"))
-                elif new_key in config.app["pixabay_api_keys"]:
-                    st.warning(tr("This API Key already exists"))
+                if config.app["pixabay_api_keys"]:
+                    st.write(tr("Current Keys:"))
+                    for key in config.app["pixabay_api_keys"]:
+                        st.code(key)
                 else:
-                    st.error(tr("Please enter a valid API Key"))
+                    st.info(tr("No Pixabay API Keys currently"))
 
-            if config.app["pixabay_api_keys"]:
-                delete_key = st.selectbox(
-                    tr("Select Pixabay API Key to delete"), config.app["pixabay_api_keys"], key="pixabay_delete_key"
-                )
-                if st.button(tr("Delete Selected Pixabay API Key")):
-                    config.app["pixabay_api_keys"].remove(delete_key)
-                    config.save_config()
-                    st.success(tr("Pixabay API Key deleted successfully"))
+                new_key = st.text_input(tr("Add Pixabay API Key"), key="pixabay_new_key")
+                if st.button(tr("Add Pixabay API Key")):
+                    if new_key and new_key not in config.app["pixabay_api_keys"]:
+                        config.app["pixabay_api_keys"].append(new_key)
+                        config.save_config()
+                        st.success(tr("Pixabay API Key added successfully"))
+                    elif new_key in config.app["pixabay_api_keys"]:
+                        st.warning(tr("This API Key already exists"))
+                    else:
+                        st.error(tr("Please enter a valid API Key"))
 
-        with col3:
-            st.subheader(tr("Coverr API Keys"))
+                if config.app["pixabay_api_keys"]:
+                    delete_key = st.selectbox(
+                        tr("Select Pixabay API Key to delete"), config.app["pixabay_api_keys"], key="pixabay_delete_key"
+                    )
+                    if st.button(tr("Delete Selected Pixabay API Key")):
+                        config.app["pixabay_api_keys"].remove(delete_key)
+                        config.save_config()
+                        st.success(tr("Pixabay API Key deleted successfully"))
 
-            # 与 pexels/pixabay 不同,coverr_api_keys 是 PR 新增配置项,
-            # 老用户的 config.toml 不一定包含,这里先兜底初始化为空列表,
-            # 防止下面 .append / 索引访问触发 KeyError。
-            if "coverr_api_keys" not in config.app or config.app["coverr_api_keys"] is None:
-                config.app["coverr_api_keys"] = []
+            with col3:
+                st.subheader(tr("Coverr API Keys"))
 
-            if config.app["coverr_api_keys"]:
-                st.write(tr("Current Keys:"))
-                for key in config.app["coverr_api_keys"]:
-                    st.code(key)
-            else:
-                st.info(tr("No Coverr API Keys currently"))
+                # 与 pexels/pixabay 不同,coverr_api_keys 是 PR 新增配置项,
+                # 老用户的 config.toml 不一定包含,这里先兜底初始化为空列表,
+                # 防止下面 .append / 索引访问触发 KeyError。
+                if "coverr_api_keys" not in config.app or config.app["coverr_api_keys"] is None:
+                    config.app["coverr_api_keys"] = []
 
-            new_key = st.text_input(tr("Add Coverr API Key"), key="coverr_new_key")
-            if st.button(tr("Add Coverr API Key")):
-                if new_key and new_key not in config.app["coverr_api_keys"]:
-                    config.app["coverr_api_keys"].append(new_key)
-                    config.save_config()
-                    st.success(tr("Coverr API Key added successfully"))
-                elif new_key in config.app["coverr_api_keys"]:
-                    st.warning(tr("This API Key already exists"))
+                if config.app["coverr_api_keys"]:
+                    st.write(tr("Current Keys:"))
+                    for key in config.app["coverr_api_keys"]:
+                        st.code(key)
                 else:
-                    st.error(tr("Please enter a valid API Key"))
+                    st.info(tr("No Coverr API Keys currently"))
 
-            if config.app["coverr_api_keys"]:
-                delete_key = st.selectbox(
-                    tr("Select Coverr API Key to delete"), config.app["coverr_api_keys"], key="coverr_delete_key"
-                )
-                if st.button(tr("Delete Selected Coverr API Key")):
-                    config.app["coverr_api_keys"].remove(delete_key)
-                    config.save_config()
-                    st.success(tr("Coverr API Key deleted successfully"))
+                new_key = st.text_input(tr("Add Coverr API Key"), key="coverr_new_key")
+                if st.button(tr("Add Coverr API Key")):
+                    if new_key and new_key not in config.app["coverr_api_keys"]:
+                        config.app["coverr_api_keys"].append(new_key)
+                        config.save_config()
+                        st.success(tr("Coverr API Key added successfully"))
+                    elif new_key in config.app["coverr_api_keys"]:
+                        st.warning(tr("This API Key already exists"))
+                    else:
+                        st.error(tr("Please enter a valid API Key"))
+
+                if config.app["coverr_api_keys"]:
+                    delete_key = st.selectbox(
+                        tr("Select Coverr API Key to delete"), config.app["coverr_api_keys"], key="coverr_delete_key"
+                    )
+                    if st.button(tr("Delete Selected Coverr API Key")):
+                        config.app["coverr_api_keys"].remove(delete_key)
+                        config.save_config()
+                        st.success(tr("Coverr API Key deleted successfully"))
 
 start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary")
 if start_button:
-    config.save_config()
+    if not platform.platform_enabled():
+        config.save_config()
     task_id = str(uuid4())
     if not params.video_subject and not params.video_script:
         st.error(tr("Video Script and Subject Cannot Both Be Empty"))
@@ -1549,4 +1681,5 @@ if start_button:
     logger.info(tr("Video Generation Completed"))
     scroll_to_bottom()
 
-config.save_config()
+if not platform.platform_enabled():
+    config.save_config()

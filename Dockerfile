@@ -71,11 +71,8 @@ RUN if [ "$PIP_USE_OFFICIAL" = "1" ]; then \
 # Now copy the rest of the codebase into the image
 COPY . .
 
-# Expose the port the app runs on
-EXPOSE 8501
-
 # Command to run the application
-CMD ["streamlit", "run", "./webui/Main.py","--browser.serverAddress=127.0.0.1","--server.enableCORS=True","--browser.gatherUsageStats=False","--server.showEmailPrompt=False"]
+CMD ["sh", "-c", "streamlit run ./webui/Main.py --server.address=0.0.0.0 --server.port=${PORT:-8501} --browser.serverAddress=127.0.0.1 --server.enableCORS=false --server.enableXsrfProtection=false --browser.gatherUsageStats=false --server.showEmailPrompt=false"]
 
 # 1. Build the Docker image using the following command
 # docker build -t moneyprinterturbo .

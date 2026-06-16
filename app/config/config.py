@@ -6,7 +6,12 @@ import toml
 from loguru import logger
 
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-config_file = f"{root_dir}/config.toml"
+configured_data_dir = os.getenv("MPT_DATA_DIR") or os.getenv("WEBNOVEL_DATA_DIR")
+if configured_data_dir:
+    os.makedirs(configured_data_dir, exist_ok=True)
+    config_file = os.path.join(configured_data_dir, "config.toml")
+else:
+    config_file = f"{root_dir}/config.toml"
 _CONTAINER_CGROUP_MARKERS = ("docker", "containerd", "kubepods", "libpod", "podman")
 _DOCKER_HOST_GATEWAY_NAME = "host.docker.internal"
 

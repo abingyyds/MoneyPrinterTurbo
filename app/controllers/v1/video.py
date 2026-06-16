@@ -30,6 +30,7 @@ from app.models.schema import (
     VideoMaterialRetrieveResponse
 )
 from app.services import state as sm
+from app.services import platform
 from app.services import task as tm
 from app.utils import file_security, utils
 
@@ -138,6 +139,12 @@ def create_task(
     body: Union[TaskVideoRequest, SubtitleRequest, AudioRequest],
     stop_at: str,
 ):
+    if platform.platform_enabled():
+        raise HttpException(
+            task_id=base.get_task_id(request),
+            status_code=403,
+            message="API task creation is disabled in hosted platform mode. Use the Web UI after login.",
+        )
     task_id = utils.get_uuid()
     request_id = base.get_task_id(request)
     try:

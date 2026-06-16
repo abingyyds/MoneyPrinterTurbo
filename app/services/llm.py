@@ -9,6 +9,7 @@ from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
+from app.services import platform
 
 _max_retries = 5
 _DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -119,6 +120,20 @@ def _extract_qwen_generation_text(response) -> str:
 def _generate_response(prompt: str) -> str:
     try:
         content = ""
+        runtime_credentials = platform.current_llm_credentials.get()
+        if runtime_credentials:
+            api_key = runtime_credentials.get("api_key", "")
+            base_url = runtime_credentials.get("base_url", "")
+            model_name = runtime_credentials.get("model", "")
+            if not api_key or not base_url or not model_name:
+                raise ValueError("SubRouter credentials are not ready. Please log in again.")
+            logger.info(f"llm provider: subrouter, model: {model_name}")
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            response = client.chat.completions.create(
+                model=model_name, messages=[{"role": "user", "content": prompt}]
+            )
+            return _extract_chat_completion_text(response, "subrouter")
+
         llm_provider = config.app.get("llm_provider", "openai")
         logger.info(f"llm provider: {llm_provider}")
         if llm_provider == "g4f":

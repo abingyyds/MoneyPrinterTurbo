@@ -12,6 +12,7 @@ from uuid import uuid4
 from loguru import logger
 
 from app.models import const
+from app.services import platform
 
 
 def get_response(status: int, data: Any = None, message: str = ""):
@@ -70,7 +71,12 @@ def root_dir():
 
 
 def storage_dir(sub_dir: str = "", create: bool = False):
-    d = os.path.join(root_dir(), "storage")
+    if platform.platform_enabled():
+        user_id = platform.current_user_id.get()
+        base_dir = platform.user_data_dir(user_id) if user_id else platform.platform_data_dir()
+        d = os.path.join(str(base_dir), "storage")
+    else:
+        d = os.path.join(root_dir(), "storage")
     if sub_dir:
         d = os.path.join(d, sub_dir)
     if create and not os.path.exists(d):
