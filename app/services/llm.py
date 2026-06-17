@@ -126,13 +126,13 @@ def _generate_response(prompt: str) -> str:
             base_url = runtime_credentials.get("base_url", "")
             model_name = runtime_credentials.get("model", "")
             if not api_key or not base_url or not model_name:
-                raise ValueError("SubRouter credentials are not ready. Please log in again.")
-            logger.info(f"llm provider: subrouter, model: {model_name}")
+                raise ValueError("模型服务凭据未准备好，请重新登录。")
+            logger.info(f"llm provider: platform, model: {model_name}")
             client = OpenAI(api_key=api_key, base_url=base_url)
             response = client.chat.completions.create(
                 model=model_name, messages=[{"role": "user", "content": prompt}]
             )
-            return _extract_chat_completion_text(response, "subrouter")
+            return _extract_chat_completion_text(response, "platform")
 
         llm_provider = config.app.get("llm_provider", "openai")
         logger.info(f"llm provider: {llm_provider}")

@@ -59,6 +59,27 @@ def _slugify(value: str, fallback: str) -> str:
     return text or fallback
 
 
+def _public_username(value: str) -> str:
+    username = str(value or "")
+    if username.startswith("subrouter-"):
+        return f"account-{username.removeprefix('subrouter-')}"
+    return username
+
+
+def public_error_message(error: Exception | str) -> str:
+    message = str(error)
+    return re.sub(r"subrouterai|subrouter", "平台", message, flags=re.IGNORECASE)
+
+
+def _unique_username(conn: sqlite3.Connection, username: str, user_id: str) -> str:
+    candidate = username
+    suffix = 0
+    while conn.execute("SELECT 1 FROM users WHERE username = ? AND id != ?", (candidate, user_id)).fetchone():
+        suffix += 1
+        candidate = f"{username}-{suffix}"
+    return candidate
+
+
 def _normalize_base_url(value: str | None) -> str:
     raw = (value or default_subrouter_base_url()).strip().rstrip("/")
     if not raw:
@@ -77,7 +98,9 @@ def _gateway_base_url(base_url: str) -> str:
 
 def default_subrouter_base_url() -> str:
     return (
-        os.environ.get("SUBROUTER_BASE_URL")
+        os.environ.get("MPT_MODEL_GATEWAY_BASE_URL")
+        or os.environ.get("MODEL_GATEWAY_BASE_URL")
+        or os.environ.get("SUBROUTER_BASE_URL")
         or os.environ.get("SUBROUTERAI_BASE_URL")
         or os.environ.get("TOONFLOW_SUBROUTER_BASE_URL")
         or DEFAULT_SUBROUTER_BASE_URL
@@ -92,9 +115,13 @@ def _parse_candidates(value: str | None) -> list[str]:
 
 def default_login_base_url_candidates() -> list[str]:
     candidates = [
+        os.environ.get("MPT_MODEL_GATEWAY_BASE_URL"),
+        os.environ.get("MODEL_GATEWAY_BASE_URL"),
         os.environ.get("SUBROUTER_BASE_URL"),
         os.environ.get("SUBROUTERAI_BASE_URL"),
         os.environ.get("TOONFLOW_SUBROUTER_BASE_URL"),
+        *_parse_candidates(os.environ.get("MPT_MODEL_GATEWAY_BASE_URL_CANDIDATES")),
+        *_parse_candidates(os.environ.get("MODEL_GATEWAY_BASE_URL_CANDIDATES")),
         *_parse_candidates(os.environ.get("SUBROUTER_BASE_URL_CANDIDATES")),
         *_parse_candidates(os.environ.get("TOONFLOW_SUBROUTER_BASE_URL_CANDIDATES")),
         DEFAULT_SUBROUTER_BASE_URL,
@@ -172,7 +199,7 @@ def _extract_distributor(payload: Any) -> dict[str, Any] | None:
         return None
     slug = str(raw.get("slug") or body.get("distributor_slug") or body.get("distributorSlug") or "").strip()
     if not dist_id or not slug:
-        raise PlatformError("用户属于分站，但 SubRouter 未返回分站 slug")
+        raise PlatformError("当前账号分站信息不完整，请联系管理员")
     return {
         "id": str(dist_id),
         "slug": slug,
@@ -306,9 +333,9 @@ class PlatformStore:
     def _public_user(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": row["id"],
-            "username": row["username"],
+            "username": _public_username(row["username"]),
             "email": row.get("email") or "",
-            "subrouter": {
+            "account": {
                 "configured": bool(str(row.get("subrouter_api_key") or "").strip()),
                 "default_model": row.get("default_model") or "",
                 "distributor_id": row.get("subrouter_distributor_id") or "",
@@ -322,9 +349,9 @@ class PlatformStore:
         username = username.strip()
         password = password.strip()
         if not username or not password:
-            raise PlatformError("SubRouter 用户名和密码不能为空")
+            raise PlatformError("用户名和密码不能为空")
 
-        last_error = "SubRouter 登录失败"
+        last_error = "登录失败"
         for candidate in default_login_base_url_candidates():
             try:
                 with requests.Session() as session:
@@ -348,13 +375,13 @@ class PlatformStore:
             allow_redirects=False,
         )
         if response.status_code >= 400:
-            raise PlatformError(_upstream_error(response, "SubRouter 登录失败"))
+            raise PlatformError(_upstream_error(response, "登录失败"))
         payload = response.json()
         if isinstance(payload, dict) and payload.get("success") is False:
-            raise PlatformError(str(payload.get("message") or "SubRouter 用户名或密码错误"))
+            raise PlatformError(str(payload.get("message") or "用户名或密码错误"))
         cookie = "; ".join(f"{item.name}={item.value}" for item in session.cookies)
         if not cookie:
-            raise PlatformError("SubRouter 登录成功但未返回会话 Cookie")
+            raise PlatformError("登录成功但未返回会话信息")
         user = _extract_user(payload)
         distributor = _extract_distributor(payload)
         return {
@@ -382,9 +409,10 @@ class PlatformStore:
         default_model = _pick_default_model(models)
         now = _utc_now()
         dist = login.get("distributor") or {}
-        username = _slugify(f"subrouter-{login.get('username') or fallback_username}", f"subrouter-{user_id[-8:]}")
+        username = _slugify(login.get("username") or fallback_username, f"account-{user_id[-8:]}")
         with self.connect() as conn:
             existing = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            username = _unique_username(conn, username, user_id)
             if existing:
                 conn.execute(
                     """
@@ -415,11 +443,6 @@ class PlatformStore:
                     ),
                 )
             else:
-                candidate = username
-                suffix = 0
-                while conn.execute("SELECT 1 FROM users WHERE username = ? AND id != ?", (candidate, user_id)).fetchone():
-                    suffix += 1
-                    candidate = f"{username}-{suffix}"
                 conn.execute(
                     """
                     INSERT INTO users (
@@ -433,7 +456,7 @@ class PlatformStore:
                     """,
                     (
                         user_id,
-                        candidate,
+                        username,
                         login.get("email") or "",
                         api_key,
                         login["base_url"],
@@ -475,10 +498,10 @@ class PlatformStore:
         else:
             response = session.get(f"{login['base_url']}/api/token/", headers=headers, timeout=20)
         if response.status_code >= 400:
-            raise PlatformError(_upstream_error(response, "获取 SubRouter 密钥列表失败"))
+            raise PlatformError(_upstream_error(response, "获取访问密钥列表失败"))
         payload = response.json()
         if isinstance(payload, dict) and payload.get("success") is False:
-            raise PlatformError(str(payload.get("message") or "获取 SubRouter 密钥列表失败"))
+            raise PlatformError(str(payload.get("message") or "获取访问密钥列表失败"))
         return _extract_items(payload)
 
     def _ensure_subrouterai_key(self, session: requests.Session, login: dict[str, Any]) -> tuple[str, str]:
@@ -502,16 +525,16 @@ class PlatformStore:
             }
         response = session.post(f"{login['base_url']}{path}", headers=headers, json=body, timeout=20)
         if response.status_code >= 400:
-            raise PlatformError(_upstream_error(response, "创建 SubRouter 访问密钥失败"))
+            raise PlatformError(_upstream_error(response, "创建访问密钥失败"))
         payload = response.json()
         if isinstance(payload, dict) and payload.get("success") is False:
-            raise PlatformError(str(payload.get("message") or "创建 SubRouter 访问密钥失败"))
+            raise PlatformError(str(payload.get("message") or "创建访问密钥失败"))
         key = _extract_key(payload)
         if key[0]:
             return key
         created = _find_reusable_key(self._list_subrouterai_keys(session, login), exact_name=name)
         if not created:
-            raise PlatformError("SubRouter 密钥已创建但未能从列表读取")
+            raise PlatformError("访问密钥已创建但未能从列表读取")
         return created
 
     def _fetch_gateway_models(self, api_key: str, base_url: str) -> list[dict[str, Any]]:
@@ -545,10 +568,10 @@ class PlatformStore:
         if response.status_code == 404:
             return []
         if response.status_code >= 400:
-            raise PlatformError(_upstream_error(response, "读取 SubRouter 订阅模型失败"))
+            raise PlatformError(_upstream_error(response, "读取订阅模型失败"))
         payload = response.json()
         if isinstance(payload, dict) and payload.get("success") is False:
-            raise PlatformError(str(payload.get("message") or "读取 SubRouter 订阅模型失败"))
+            raise PlatformError(str(payload.get("message") or "读取订阅模型失败"))
         models = []
         for item in _extract_items(payload):
             if not isinstance(item, dict):

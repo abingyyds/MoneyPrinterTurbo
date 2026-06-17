@@ -238,8 +238,8 @@ def stop_if_not_signed_in():
     user = st.session_state.get("platform_user")
     if not user:
         st.title("MoneyPrinterTurbo")
-        st.caption("使用 SubRouter 账号密码登录后，选择模型即可生成视频。")
-        with st.form("subrouter_login_form"):
+        st.caption("使用平台账号密码登录后，选择模型即可生成视频。")
+        with st.form("platform_login_form"):
             username = st.text_input("用户名")
             password = st.text_input("密码", type="password")
             submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
@@ -248,10 +248,10 @@ def stop_if_not_signed_in():
                 user = platform.get_store().subrouter_password_login(username=username, password=password)
                 st.session_state["platform_user"] = user
                 st.session_state["platform_models"] = []
-                st.session_state["platform_model"] = user.get("subrouter", {}).get("default_model", "")
+                st.session_state["platform_model"] = user.get("account", {}).get("default_model", "")
                 st.rerun()
             except Exception as exc:
-                st.error(str(exc))
+                st.error(platform.public_error_message(exc))
         st.stop()
 
     platform.activate_user_context(user["id"])
@@ -262,8 +262,8 @@ def render_platform_account_bar():
         return
 
     user = st.session_state.get("platform_user") or {}
-    subrouter = user.get("subrouter", {})
-    distributor = subrouter.get("distributor_name") or subrouter.get("distributor_slug") or ""
+    account = user.get("account", {})
+    distributor = account.get("distributor_name") or account.get("distributor_slug") or ""
     with st.sidebar:
         st.caption("ACCOUNT")
         st.write(distributor or user.get("username", "当前账号"))
@@ -296,7 +296,7 @@ def render_platform_account_bar():
             else:
                 st.warning("当前账号没有可用模型")
         except Exception as exc:
-            st.error(f"模型列表读取失败: {exc}")
+            st.error(f"模型列表读取失败: {platform.public_error_message(exc)}")
 
 
 stop_if_not_signed_in()
