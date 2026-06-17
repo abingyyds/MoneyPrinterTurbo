@@ -113,6 +113,12 @@ def _parse_candidates(value: str | None) -> list[str]:
     return [part.strip() for part in re.split(r"[,\n;]", value) if part.strip()]
 
 
+def _normalize_host(value: str | None) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"^https?://", "", text, flags=re.IGNORECASE).strip("/")
+    return text.split("/", 1)[0]
+
+
 def default_login_base_url_candidates() -> list[str]:
     candidates = [
         os.environ.get("MPT_MODEL_GATEWAY_BASE_URL"),
@@ -151,23 +157,23 @@ def _bearer(api_key: str) -> str:
 
 
 def _extract_items(payload: Any) -> list[Any]:
-    candidates = []
-    if isinstance(payload, dict):
-        data = payload.get("data")
-        candidates.extend(
-            [
-                data.get("items") if isinstance(data, dict) else None,
-                data.get("models") if isinstance(data, dict) else None,
-                data.get("data") if isinstance(data, dict) else None,
-                data,
-                payload.get("items"),
-                payload.get("models"),
-            ]
-        )
-    candidates.append(payload)
-    for item in candidates:
-        if isinstance(item, list):
-            return item
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+
+    nested = []
+    for key in ("data", "items", "models", "list", "rows"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested.append(value)
+
+    for value in nested:
+        items = _extract_items(value)
+        if items:
+            return items
     return []
 
 
@@ -189,21 +195,36 @@ def _extract_distributor(payload: Any) -> dict[str, Any] | None:
         return None
     body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     raw = body.get("distributor") if isinstance(body.get("distributor"), dict) else {}
+    if not raw and (body.get("slug") or body.get("domain") or body.get("site_domain") or body.get("siteDomain")):
+        raw = body
     dist_id = body.get("distributor_id") or body.get("distributorId") or raw.get("id")
     belongs = body.get("belongs_to_distributor")
     if belongs is None:
         belongs = body.get("belongsToDistributor")
     if belongs is None:
+        belongs = body.get("has_distributor")
+    if belongs is None:
+        belongs = body.get("hasDistributor")
+    if belongs is None:
         belongs = bool(dist_id)
     if not belongs:
         return None
     slug = str(raw.get("slug") or body.get("distributor_slug") or body.get("distributorSlug") or "").strip()
-    if not dist_id or not slug:
+    domain = _normalize_host(
+        raw.get("domain")
+        or raw.get("site_domain")
+        or raw.get("siteDomain")
+        or body.get("distributor_domain")
+        or body.get("distributorDomain")
+        or body.get("domain")
+    )
+    if not dist_id or not (slug or domain):
         raise PlatformError("当前账号分站信息不完整，请联系管理员")
     return {
         "id": str(dist_id),
-        "slug": slug,
+        "slug": slug or domain or str(dist_id),
         "name": str(raw.get("name") or body.get("distributor_name") or body.get("distributorName") or ""),
+        "domain": domain,
     }
 
 
@@ -247,6 +268,36 @@ def _infer_model_type(model_id: str) -> str:
     if re.search(r"image|img|seedream|nano|gpt-image|flux|dalle|dall-e|midjourney|ideogram", text):
         return "image"
     return "text"
+
+
+def _model_from_item(item: Any) -> dict[str, str] | None:
+    if isinstance(item, dict):
+        model_id = str(
+            item.get("model_name")
+            or item.get("modelName")
+            or item.get("model_id")
+            or item.get("modelId")
+            or item.get("id")
+            or item.get("model")
+            or item.get("name")
+            or ""
+        ).strip()
+        category = str(item.get("category") or item.get("type") or item.get("model_type") or item.get("modelType") or "")
+    else:
+        model_id = str(item or "").strip()
+        category = ""
+    if not model_id:
+        return None
+    return {"id": model_id, "type": _infer_model_type(f"{model_id} {category}")}
+
+
+def _dedupe_models(models: list[dict[str, str]]) -> list[dict[str, str]]:
+    result = {}
+    for item in models:
+        model_id = str(item.get("id") or "").strip()
+        if model_id and model_id not in result:
+            result[model_id] = {"id": model_id, "type": item.get("type") or _infer_model_type(model_id)}
+    return sorted(result.values(), key=lambda item: item["id"])
 
 
 def _pick_default_model(models: list[dict[str, Any]]) -> str:
@@ -313,12 +364,16 @@ class PlatformStore:
                     subrouter_distributor_id TEXT NOT NULL DEFAULT '',
                     subrouter_distributor_slug TEXT NOT NULL DEFAULT '',
                     subrouter_distributor_name TEXT NOT NULL DEFAULT '',
+                    subrouter_distributor_domain TEXT NOT NULL DEFAULT '',
                     default_model TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "subrouter_distributor_domain" not in columns:
+                conn.execute("ALTER TABLE users ADD COLUMN subrouter_distributor_domain TEXT NOT NULL DEFAULT ''")
 
     def health(self) -> dict[str, Any]:
         return {"ok": True, "platform": platform_enabled(), "data_dir": str(self.data_dir)}
@@ -341,6 +396,7 @@ class PlatformStore:
                 "distributor_id": row.get("subrouter_distributor_id") or "",
                 "distributor_slug": row.get("subrouter_distributor_slug") or "",
                 "distributor_name": row.get("subrouter_distributor_name") or "",
+                "distributor_domain": row.get("subrouter_distributor_domain") or "",
                 "account_type": "dist" if row.get("subrouter_distributor_id") else "main",
             },
         }
@@ -384,10 +440,16 @@ class PlatformStore:
             raise PlatformError("登录成功但未返回会话信息")
         user = _extract_user(payload)
         distributor = _extract_distributor(payload)
+        headers = {"Cookie": cookie}
+        external_user_id = str(user.get("id") or "").strip()
+        if external_user_id:
+            headers["New-Api-User"] = external_user_id
+        if not distributor:
+            distributor = self._fetch_self_distributor(_normalize_base_url(base_url), headers)
         return {
             "provider": "subrouterai",
             "base_url": _normalize_base_url(base_url),
-            "external_user_id": str(user.get("id") or "").strip(),
+            "external_user_id": external_user_id,
             "username": str(user.get("username") or username),
             "email": str(user.get("email") or ""),
             "display_name": str(user.get("display_name") or user.get("displayName") or user.get("username") or username),
@@ -405,7 +467,7 @@ class PlatformStore:
         account_seed = login.get("external_user_id") or login.get("email") or login.get("username") or fallback_username
         user_id = "sr_" + hashlib.sha256(f"subrouterai:{account_seed}".encode("utf-8")).hexdigest()[:24]
         api_key, api_key_id = self._ensure_subrouterai_key(session, login)
-        models = self._fetch_gateway_models(api_key, login["base_url"])
+        models = self._fetch_login_models(login, api_key)
         default_model = _pick_default_model(models)
         now = _utc_now()
         dist = login.get("distributor") or {}
@@ -421,8 +483,8 @@ class PlatformStore:
                         subrouter_base_url = ?, subrouter_external_user_id = ?,
                         subrouter_session_cookie = ?, subrouter_api_key_id = ?,
                         subrouter_distributor_id = ?, subrouter_distributor_slug = ?,
-                        subrouter_distributor_name = ?,
-                        default_model = COALESCE(NULLIF(default_model, ''), ?),
+                        subrouter_distributor_name = ?, subrouter_distributor_domain = ?,
+                        default_model = ?,
                         updated_at = ?
                     WHERE id = ?
                     """,
@@ -437,7 +499,8 @@ class PlatformStore:
                         dist.get("id") or "",
                         dist.get("slug") or "",
                         dist.get("name") or "",
-                        default_model,
+                        dist.get("domain") or "",
+                        default_model or str(existing["default_model"] or ""),
                         now,
                         user_id,
                     ),
@@ -450,9 +513,10 @@ class PlatformStore:
                         subrouter_external_user_id, subrouter_session_cookie,
                         subrouter_api_key_id, subrouter_distributor_id,
                         subrouter_distributor_slug, subrouter_distributor_name,
+                        subrouter_distributor_domain,
                         default_model, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -466,6 +530,7 @@ class PlatformStore:
                         dist.get("id") or "",
                         dist.get("slug") or "",
                         dist.get("name") or "",
+                        dist.get("domain") or "",
                         default_model,
                         now,
                         now,
@@ -479,12 +544,46 @@ class PlatformStore:
             headers["New-Api-User"] = str(login["external_user_id"])
         return headers
 
+    def _dist_site_headers(self, login: dict[str, Any]) -> dict[str, str]:
+        distributor = login.get("distributor") or {}
+        headers = self._auth_headers(login)
+        host = _normalize_host(distributor.get("domain") or distributor.get("slug") or "")
+        if host:
+            headers["Host"] = host
+        return headers
+
     def _auth_headers_from_row(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
         headers = {"Cookie": str(row["subrouter_session_cookie"] or "")}
         external_user_id = str(row["subrouter_external_user_id"] or "")
         if external_user_id:
             headers["New-Api-User"] = external_user_id
         return headers
+
+    def _dist_site_headers_from_row(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, str]:
+        headers = self._auth_headers_from_row(row)
+        domain = row["subrouter_distributor_domain"] if "subrouter_distributor_domain" in row.keys() else ""
+        host = _normalize_host(domain or row["subrouter_distributor_slug"] or row["subrouter_distributor_id"])
+        if host:
+            headers["Host"] = host
+        return headers
+
+    def _fetch_self_distributor(self, base_url: str, headers: dict[str, str]) -> dict[str, Any] | None:
+        response = requests.get(
+            f"{_normalize_base_url(base_url)}/api/user/self/distributor",
+            headers=headers,
+            timeout=20,
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            raise PlatformError(_upstream_error(response, "读取分站信息失败"))
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("success") is False:
+            message = str(payload.get("message") or "")
+            if "not" in message.lower() or "没有" in message or "无" in message:
+                return None
+            raise PlatformError(message or "读取分站信息失败")
+        return _extract_distributor(payload)
 
     def _list_subrouterai_keys(self, session: requests.Session, login: dict[str, Any]) -> list[Any]:
         headers = self._auth_headers(login)
@@ -548,16 +647,10 @@ class PlatformStore:
         payload = response.json()
         models = []
         for item in _extract_items(payload):
-            if isinstance(item, dict):
-                model_id = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
-                category = str(item.get("category") or item.get("type") or "")
-            else:
-                model_id = str(item or "").strip()
-                category = ""
-            if model_id:
-                models.append({"id": model_id, "type": _infer_model_type(f"{model_id} {category}")})
-        models.sort(key=lambda item: item["id"])
-        return models
+            model = _model_from_item(item)
+            if model:
+                models.append(model)
+        return _dedupe_models(models)
 
     def _fetch_subscribed_models(self, row: sqlite3.Row | dict[str, Any]) -> list[dict[str, Any]]:
         response = requests.get(
@@ -574,20 +667,70 @@ class PlatformStore:
             raise PlatformError(str(payload.get("message") or "读取订阅模型失败"))
         models = []
         for item in _extract_items(payload):
-            if not isinstance(item, dict):
-                continue
-            model_id = str(
-                item.get("model_name")
-                or item.get("modelName")
-                or item.get("id")
-                or item.get("name")
-                or ""
-            ).strip()
-            category = str(item.get("category") or item.get("type") or "")
-            if model_id:
-                models.append({"id": model_id, "type": _infer_model_type(f"{model_id} {category}")})
-        models.sort(key=lambda item: item["id"])
-        return models
+            model = _model_from_item(item)
+            if model:
+                models.append(model)
+        return _dedupe_models(models)
+
+    def _fetch_dist_site_models(self, base_url: str, headers: dict[str, str]) -> list[dict[str, Any]]:
+        if not headers.get("Host"):
+            return []
+        response = requests.get(
+            f"{_normalize_base_url(base_url)}/api/dist/site/models",
+            headers=headers,
+            timeout=20,
+        )
+        if response.status_code == 404:
+            return []
+        if response.status_code >= 400:
+            raise PlatformError(_upstream_error(response, "读取分站模型失败"))
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("success") is False:
+            raise PlatformError(str(payload.get("message") or "读取分站模型失败"))
+        models = []
+        for item in _extract_items(payload):
+            model = _model_from_item(item)
+            if model:
+                models.append(model)
+        return _dedupe_models(models)
+
+    def _refresh_distributor_info(
+        self,
+        user_id: str,
+        row: sqlite3.Row | dict[str, Any],
+    ) -> dict[str, Any] | None:
+        distributor = self._fetch_self_distributor(row["subrouter_base_url"], self._auth_headers_from_row(row))
+        if not distributor:
+            return None
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE users
+                SET subrouter_distributor_id = ?,
+                    subrouter_distributor_slug = ?,
+                    subrouter_distributor_name = ?,
+                    subrouter_distributor_domain = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    distributor.get("id") or row["subrouter_distributor_id"],
+                    distributor.get("slug") or row["subrouter_distributor_slug"],
+                    distributor.get("name") or row["subrouter_distributor_name"],
+                    distributor.get("domain") or "",
+                    _utc_now(),
+                    user_id,
+                ),
+            )
+        return distributor
+
+    def _fetch_login_models(self, login: dict[str, Any], api_key: str) -> list[dict[str, Any]]:
+        distributor = login.get("distributor")
+        if distributor:
+            models = self._fetch_dist_site_models(login["base_url"], self._dist_site_headers(login))
+            if models:
+                return models
+        return self._fetch_gateway_models(api_key, login["base_url"])
 
     def fetch_models(self, user_id: str) -> dict[str, Any]:
         with self.connect() as conn:
@@ -599,7 +742,19 @@ class PlatformStore:
             raise PlatformError("当前账号未准备好模型调用密钥，请重新登录")
         default_model = str(row["default_model"] or "")
         models = []
-        if not row["subrouter_distributor_id"]:
+        if row["subrouter_distributor_id"]:
+            models = self._fetch_dist_site_models(row["subrouter_base_url"], self._dist_site_headers_from_row(row))
+            if not models and not row["subrouter_distributor_domain"]:
+                distributor = self._refresh_distributor_info(user_id, row)
+                if distributor:
+                    login = {
+                        "base_url": row["subrouter_base_url"],
+                        "external_user_id": row["subrouter_external_user_id"],
+                        "session_cookie": row["subrouter_session_cookie"],
+                        "distributor": distributor,
+                    }
+                    models = self._fetch_dist_site_models(row["subrouter_base_url"], self._dist_site_headers(login))
+        else:
             models = self._fetch_subscribed_models(row)
         if not models:
             models = self._fetch_gateway_models(api_key, row["subrouter_base_url"])
